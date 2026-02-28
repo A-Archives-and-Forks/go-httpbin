@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -25,7 +26,11 @@ const (
 	defaultListenHost = "0.0.0.0"
 	defaultListenPort = 8080
 	defaultLogFormat  = "text"
+	defaultLogLevel   = "INFO"
 	defaultEnvPrefix  = "HTTPBIN_ENV_"
+
+	// Disable all logging by setting the level above any possible value
+	logLevelOff = slog.Level(math.MaxInt)
 
 	// Reasonable defaults for the underlying http.Server
 	defaultSrvReadTimeout       = 5 * time.Second
@@ -67,13 +72,7 @@ func mainImpl(args []string, getEnvVal func(string) string, getEnviron func() []
 		return 1
 	}
 
-	logger := slog.New(slog.NewTextHandler(out, nil))
-
-	if cfg.LogFormat == "json" {
-		// use structured logging if requested
-		handler := slog.NewJSONHandler(out, nil)
-		logger = slog.New(handler)
-	}
+	logger := setupLogger(out, cfg.LogFormat, cfg.LogLevel)
 
 	opts := []httpbin.OptionFunc{
 		httpbin.WithEnv(cfg.Env),
@@ -127,6 +126,7 @@ type config struct {
 	TLSCertFile            string
 	TLSKeyFile             string
 	LogFormat              string
+	LogLevel               slog.Level
 	SrvMaxHeaderBytes      int
 	SrvReadHeaderTimeout   time.Duration
 	SrvReadTimeout         time.Duration
@@ -141,6 +141,7 @@ type config struct {
 
 	// temporary placeholders for arguments that need extra processing
 	rawAllowedRedirectDomains string
+	rawLogLevel               string
 	rawUseRealHostname        bool
 }
 
@@ -176,6 +177,7 @@ func loadConfig(args []string, getEnvVal func(string) string, getEnviron func() 
 	fs.StringVar(&cfg.TLSKeyFile, "https-key-file", "", "HTTPS Server private key file")
 	fs.StringVar(&cfg.ExcludeHeaders, "exclude-headers", "", "Drop platform-specific headers. Comma-separated list of headers key to drop, supporting wildcard matching.")
 	fs.StringVar(&cfg.LogFormat, "log-format", defaultLogFormat, "Log format (text or json)")
+	fs.StringVar(&cfg.rawLogLevel, "log-level", defaultLogLevel, "Logging level (DEBUG, INFO, WARN, ERROR, OFF)")
 	fs.IntVar(&cfg.SrvMaxHeaderBytes, "srv-max-header-bytes", defaultSrvMaxHeaderBytes, "Value to use for the http.Server's MaxHeaderBytes option")
 	fs.DurationVar(&cfg.SrvReadHeaderTimeout, "srv-read-header-timeout", defaultSrvReadHeaderTimeout, "Value to use for the http.Server's ReadHeaderTimeout option")
 	fs.DurationVar(&cfg.SrvReadTimeout, "srv-read-timeout", defaultSrvReadTimeout, "Value to use for the http.Server's ReadTimeout option")
@@ -272,6 +274,13 @@ func loadConfig(args []string, getEnvVal func(string) string, getEnviron func() 
 	if cfg.LogFormat != "text" && cfg.LogFormat != "json" {
 		return nil, configErr(`invalid log format %q, must be "text" or "json"`, cfg.LogFormat)
 	}
+	if cfg.rawLogLevel == defaultLogLevel && getEnvVal("LOG_LEVEL") != "" {
+		cfg.rawLogLevel = getEnvVal("LOG_LEVEL")
+	}
+	cfg.LogLevel, err = parseLogLevel(cfg.rawLogLevel)
+	if err != nil {
+		return nil, configErr(`invalid log level %q, must be one of "DEBUG", "INFO", "WARN", "ERROR", "OFF"`, cfg.rawLogLevel)
+	}
 
 	if getEnvBool(getEnvVal("USE_REAL_HOSTNAME")) {
 		cfg.rawUseRealHostname = true
@@ -319,6 +328,7 @@ func loadConfig(args []string, getEnvVal func(string) string, getEnviron func() 
 
 	// reset temporary fields to their zero values
 	cfg.rawAllowedRedirectDomains = ""
+	cfg.rawLogLevel = ""
 	cfg.rawUseRealHostname = false
 
 	for _, envVar := range getEnviron() {
@@ -337,6 +347,42 @@ func loadConfig(args []string, getEnvVal func(string) string, getEnviron func() 
 
 func getEnvBool(val string) bool {
 	return val == "1" || val == "true"
+}
+
+func parseLogLevel(s string) (slog.Level, error) {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "DEBUG":
+		return slog.LevelDebug, nil
+	case "INFO":
+		return slog.LevelInfo, nil
+	case "WARN":
+		return slog.LevelWarn, nil
+	case "ERROR":
+		return slog.LevelError, nil
+	case "OFF":
+		return logLevelOff, nil
+	default:
+		return 0, fmt.Errorf("invalid log level %q", s)
+	}
+}
+
+func setupLogger(out io.Writer, logFormat string, level slog.Level) *slog.Logger {
+	if level == logLevelOff {
+		out = io.Discard
+	}
+
+	opts := &slog.HandlerOptions{
+		Level: level,
+	}
+
+	var handler slog.Handler
+	if logFormat == "json" {
+		handler = slog.NewJSONHandler(out, opts)
+	} else {
+		handler = slog.NewTextHandler(out, opts)
+	}
+
+	return slog.New(handler)
 }
 
 func listenAndServeGracefully(srv *http.Server, cfg *config, logger *slog.Logger) error {
